@@ -150,3 +150,51 @@ the numeric behavior (differs only in the last few mantissa bits, in a
 pure-arithmetic function with no data-dependent branching) is the
 signature of exactly that class of issue, not a logic bug in the algorithm
 itself.
+
+## Portable rewrite
+
+`float-divergence/main.go` also has `mFastLog2Portable`: the same function
+with the refinement polynomial evaluated in `float64` instead of `float32`,
+converting back to `float32` only for the return value. Rationale: float64
+has roughly 2^29 times float32's resolution here, so an FMA-vs-no-FMA
+double-rounding difference — which shows up in float32's last 1-2 mantissa
+bits — becomes many orders of magnitude smaller than float32 can even
+represent. In other words, whatever tiny rounding difference the two
+architectures' codegen produces gets absorbed before the final narrowing
+conversion, instead of leaking into the result.
+
+On the single diverging histogram from `testdata.bin`:
+
+```
+arm64 original: shannon=250361.98  ->  result=250361
+arm64 portable: shannon=250362.00  ->  result=250362   (now matches amd64)
+amd64 original: shannon=250362.06  ->  result=250362
+amd64 portable: shannon=250362.06  ->  result=250362   (unchanged)
+```
+
+More importantly, this isn't just fixed for the one isolated histogram —
+applying the equivalent one-line change to a real
+`github.com/klauspost/compress@v1.20.0` checkout (via a `replace` directive)
+and recompressing the *entire* `testdata.bin` through the unmodified
+`flate.NewWriter(w, 3)` API gives byte-for-byte identical output on both
+architectures:
+
+```
+arm64 (patched):  compressed_sha256=485a8c79e4888759521afde1ea9d2cf2e3d21a621000ed0183c502d8a8a843d0
+amd64 (patched):  compressed_sha256=485a8c79e4888759521afde1ea9d2cf2e3d21a621000ed0183c502d8a8a843d0
+```
+
+(That's amd64's original hash — arm64 changed to match it, since amd64's
+`GOAMD64=v1` baseline codegen happens to be the "no FMA" reference
+behavior here.) A round-trip decompress of that patched output still
+reproduces `testdata.bin` exactly (`sha256:28b4d8bb...`), so this isn't
+just moving the divergence around — it's a real fix for this input.
+
+Caveats: this widens every log2 call in the hot Shannon-estimate path from
+`float32` to `float64` arithmetic, which has some (probably small, not
+benchmarked here) performance cost, and it's a probabilistic argument, not
+a mathematical proof of portability — float64 could in principle still hit
+its own double-rounding boundary given a sufficiently adversarial (and
+almost certainly practically unreachable) histogram. It has not been fuzz
+tested across many inputs, only validated against the one histogram that's
+known to trigger the original bug.

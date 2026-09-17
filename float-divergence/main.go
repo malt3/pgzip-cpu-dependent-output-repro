@@ -20,12 +20,20 @@
 // completely different (but equally valid) compressed byte stream from
 // that point on.
 //
+// mFastLog2Portable below is a candidate fix: it evaluates the same
+// polynomial in float64 instead of float32, converting back to float32
+// only for the return value. Verified end-to-end (see ../README.md): with
+// this one change applied to a real klauspost/compress checkout, the full
+// compression of ../testdata.bin at level 3 produces byte-for-byte
+// identical output on arm64 and amd64 (and still round-trips correctly).
+//
 // No file, no klauspost/compress import, no pgzip: this only needs
 // mFastLog2/EstimatedBits, copied verbatim from
 // klauspost/compress@v1.20.0's flate/token.go, fed one real histogram
 // (captured from compressing ../testdata.bin — see ../README.md for how).
 //
-// Usage: go run . on arm64 and on amd64 (Rosetta/Docker/native); compare.
+// Usage: go run . on arm64 and on amd64 (Rosetta/Docker/native); compare
+// both the "original" and "portable" lines each prints.
 package main
 
 import (
@@ -46,6 +54,24 @@ func mFastLog2(val float32) float32 {
 	return log2
 }
 
+// mFastLog2Portable is mFastLog2 with the refinement polynomial evaluated
+// in float64 instead of float32, converting back to float32 only in the
+// final return. float64 has ~2^29 times float32's resolution here, so an
+// FMA-vs-no-FMA double-rounding difference — which shows up in float32's
+// last 1-2 mantissa bits — becomes many orders of magnitude smaller than
+// float32 can even represent, i.e. the float64 result rounds to the exact
+// same float32 on every architecture. The bit-twiddling exponent-extraction
+// part is untouched (pure integer ops, already portable).
+func mFastLog2Portable(val float32) float32 {
+	ux := int32(math.Float32bits(val))
+	log2 := float64(((ux >> 23) & 255) - 128)
+	ux &= -0x7f800001
+	ux += 127 << 23
+	uval := float64(math.Float32frombits(uint32(ux)))
+	log2 += ((-0.34484843)*uval+2.02466578)*uval - 0.67487759
+	return float32(log2)
+}
+
 func atLeastOne(v float32) float32 {
 	if v < 1 {
 		return 1
@@ -63,8 +89,10 @@ var lengthExtraBits = [32]uint8{ /* unused for this repro's estimate path beyond
 var offsetExtraBits = [32]uint8{}
 
 // estimatedBits is an exact copy of (*tokens).EstimatedBits, taking the raw
-// histograms directly instead of a *tokens.
-func estimatedBits(n int, nFilled int, litHist [256]uint16, extraHist [32]uint16, offHist [32]uint16) (float32, int) {
+// histograms directly instead of a *tokens. useLog2 selects which mFastLog2
+// variant to use, so both the original and the portable rewrite can be
+// compared against the same input.
+func estimatedBits(n int, nFilled int, litHist [256]uint16, extraHist [32]uint16, offHist [32]uint16, log2 func(float32) float32) (float32, int) {
 	shannon := float32(0)
 	bits := 0
 	nMatches := 0
@@ -74,14 +102,14 @@ func estimatedBits(n int, nFilled int, litHist [256]uint16, extraHist [32]uint16
 		for _, v := range litHist[:] {
 			if v > 0 {
 				nn := float32(v)
-				shannon += atLeastOne(-mFastLog2(nn*invTotal)) * nn
+				shannon += atLeastOne(-log2(nn*invTotal)) * nn
 			}
 		}
 		shannon += 15
 		for i, v := range extraHist[1 : literalCount-256] {
 			if v > 0 {
 				nn := float32(v)
-				shannon += atLeastOne(-mFastLog2(nn*invTotal)) * nn
+				shannon += atLeastOne(-log2(nn*invTotal)) * nn
 				bits += int(lengthExtraBits[i&31]) * int(v)
 				nMatches += int(v)
 			}
@@ -92,7 +120,7 @@ func estimatedBits(n int, nFilled int, litHist [256]uint16, extraHist [32]uint16
 		for i, v := range offHist[:offsetCodeCount] {
 			if v > 0 {
 				nn := float32(v)
-				shannon += atLeastOne(-mFastLog2(nn*invTotal)) * nn
+				shannon += atLeastOne(-log2(nn*invTotal)) * nn
 				bits += int(offsetExtraBits[i&31]) * int(v)
 			}
 		}
@@ -110,6 +138,9 @@ func main() {
 	extraHist := [32]uint16{1, 0, 0, 948, 759, 557, 335, 169, 139, 295, 153, 152, 59, 137, 42, 17, 16, 28, 11, 3, 5, 5, 2, 0, 0, 1, 0, 0, 0, 0, 0, 0}
 	offHist := [32]uint16{0, 5, 0, 6, 71, 86, 80, 45, 89, 106, 159, 81, 241, 83, 270, 83, 155, 144, 160, 139, 217, 87, 179, 149, 263, 119, 232, 160, 229, 195, 0, 0}
 
-	shannon, result := estimatedBits(n, nFilled, litHist, extraHist, offHist)
-	fmt.Printf("shannon_bits=%08x shannon=%v result=%d\n", math.Float32bits(shannon), shannon, result)
+	shannon, result := estimatedBits(n, nFilled, litHist, extraHist, offHist, mFastLog2)
+	fmt.Printf("original: shannon_bits=%08x shannon=%v result=%d\n", math.Float32bits(shannon), shannon, result)
+
+	pShannon, pResult := estimatedBits(n, nFilled, litHist, extraHist, offHist, mFastLog2Portable)
+	fmt.Printf("portable: shannon_bits=%08x shannon=%v result=%d\n", math.Float32bits(pShannon), pShannon, pResult)
 }
