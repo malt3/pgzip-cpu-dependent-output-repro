@@ -67,3 +67,86 @@ pgzip (jobs=1)           GOARCH=amd64  sha256=5b9cc20bb02558027778edf7d71d7ed6e4
 klauspost/compress/flate GOARCH=amd64  sha256=485a8c79e4888759521afde1ea9d2cf2e3d21a621000ed0183c502d8a8a843d0
 stdlib compress/flate    GOARCH=amd64  sha256=c0352918b24e8c5f98569c4a03e2ba67f02e98578e3f29791a0dcadcc4659e87
 ```
+
+## Exact root cause
+
+It is **not** in LZ77 match-finding (`fastEncL3`, the level-3 fast encoder
+that picks literals vs. back-references). Two independent ways to check
+that:
+
+1. `tracedump/` is a from-scratch, chunk-accurate reimplementation of
+   `fastEncL3.Encode` (copied from `flate/level3.go` +
+   `flate/fast_encoder.go`, replicating the outer 64KB-window chunking and
+   the history-buffer compaction, both of which matter for fidelity) that
+   prints every literal-run/match decision instead of building real tokens.
+   Run it on `testdata.bin` on both architectures and `diff` the two trace
+   files — they are byte-for-byte identical (all ~62k events).
+2. Patching the real `klauspost/compress/flate` package to dump its actual
+   token stream and literal/offset/extra-length histograms right after
+   `fastEncL3.Encode` runs (before Huffman coding) shows the same thing:
+   identical `sha256` of the token array and histograms, for all 9
+   `Encode()` calls the 576KB input gets split into, on both architectures.
+
+So the token stream feeding Huffman coding is provably portable. The actual
+fork point is one level up, in `huffman_bit_writer.go`'s
+`writeBlockDynamic`, which decides whether to **reuse the previous block's
+Huffman table** or build a new one, based on comparing `newSize` (a size
+estimate for a new table) against `reuseSize`. `newSize` is computed from
+`(*tokens).EstimatedBits()` — a Shannon-entropy estimate — which uses
+`token.go`'s `mFastLog2`, a fast float32 log2 approximation:
+
+```go
+func mFastLog2(val float32) float32 {
+	ux := int32(math.Float32bits(val))
+	log2 := (float32)(((ux >> 23) & 255) - 128)
+	ux &= -0x7f800001
+	ux += 127 << 23
+	uval := math.Float32frombits(uint32(ux))
+	log2 += ((-0.34484843)*uval+2.02466578)*uval - 0.67487759
+	return log2
+}
+```
+
+That last line is a Horner-form polynomial (two chained multiply-adds).
+Evaluated on the same `uval` on arm64 vs. amd64, it comes out different in
+the last couple of mantissa bits — almost certainly because arm64's Go
+backend contracts the chained multiply-adds into native FMA (fused
+multiply-add, rounds once) while amd64's baseline codegen (`GOAMD64=v1`,
+which doesn't assume FMA3 availability) does not (multiply then add,
+rounds twice). `EstimatedBits()` sums many of these per-symbol log2 terms
+into a running `shannon float32`, then does a bare `int(shannon)` — no
+rounding, pure truncation. For one specific block in `testdata.bin`, that
+sum lands within ~0.08 of an integer boundary, and the tiny FMA-vs-no-FMA
+difference truncates to a **different integer** on each architecture:
+
+```
+arm64:  shannon=250361.98  ->  int(shannon) = 250361
+amd64:  shannon=250362.06  ->  int(shannon) = 250362
+```
+
+That one-off difference feeds directly into the `newSize < reuseSize`
+comparison, flipping the table-reuse decision, so everything written from
+that point on is a different (but equally valid — both decompress to the
+same content) sequence of Huffman-coded bits.
+
+`float-divergence/` reproduces exactly this, standalone: no file input, no
+`klauspost/compress` import, no pgzip — just `mFastLog2` and
+`EstimatedBits`, copied verbatim, fed one real histogram captured from the
+diverging block. `go run .` on arm64 vs. amd64 (Rosetta or a real box) is
+the whole repro:
+
+```
+$ ./floatdiv_arm64
+shannon_bits=48747e7f shannon=250361.98 result=250361
+$ ./floatdiv_amd64
+shannon_bits=48747e84 shannon=250362.06 result=250362
+```
+
+I could not fully confirm the FMA-contraction mechanism directly (building
+with `GOAMD64=v3`, which permits the Go compiler to assume FMA3 on amd64,
+fails under Rosetta with "This program can only be run on AMD64 processors
+with v3 microarchitecture support" — Rosetta doesn't expose that far), but
+the numeric behavior (differs only in the last few mantissa bits, in a
+pure-arithmetic function with no data-dependent branching) is the
+signature of exactly that class of issue, not a logic bug in the algorithm
+itself.
