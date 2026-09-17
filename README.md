@@ -142,16 +142,30 @@ $ ./floatdiv_amd64
 shannon_bits=48747e84 shannon=250362.06 result=250362
 ```
 
-I could not fully confirm the FMA-contraction mechanism directly (building
-with `GOAMD64=v3`, which permits the Go compiler to assume FMA3 on amd64,
-fails under Rosetta with "This program can only be run on AMD64 processors
-with v3 microarchitecture support" — Rosetta doesn't expose that far), but
-the numeric behavior (differs only in the last few mantissa bits, in a
-pure-arithmetic function with no data-dependent branching) is the
-signature of exactly that class of issue, not a logic bug in the algorithm
-itself.
+Confirmed directly by disassembly (`go build -gcflags=-S`, filtering to
+`mFastLog2`'s `TEXT` block) — this is not speculation:
 
-## Portable rewrite
+| build | instructions for the polynomial | roundings |
+|---|---|---|
+| `arm64` | `FMADDS` then `FNMSUBS` (both fused) | 2 |
+| `GOOS=darwin GOARCH=amd64 GOAMD64=v1` (baseline) | `MULSS ADDSS` then `MULSS SUBSS` (fully separate) | 4 |
+| `GOOS=darwin GOARCH=amd64 GOAMD64=v3` | `VFMADD231SS` (fused) then `MULSS SUBSS` (separate) | 3 |
+
+Three different rounding counts for the exact same source line, one per
+architecture/microarchitecture level. This is not a compiler bug: Go's
+spec, under "Floating-point operators", explicitly permits it — *"an
+implementation may combine multiple floating-point operations into a
+single fused operation... and produce a result that differs from the value
+obtained by executing and rounding the instructions individually."* The
+bug, if there is one, is in `klauspost/compress` relying on bit-reproducible
+float32 arithmetic in a spec-compliant-but-architecture-variable code path.
+
+(I couldn't get `GOAMD64=v3` to actually *run* under Rosetta — "This
+program can only be run on AMD64 processors with v3 microarchitecture
+support" — so the v3 row above is from inspecting its generated assembly
+only, not from executing it.)
+
+## Portable rewrite: widen to float64
 
 `float-divergence/main.go` also has `mFastLog2Portable`: the same function
 with the refinement polynomial evaluated in `float64` instead of `float32`,
@@ -198,3 +212,74 @@ its own double-rounding boundary given a sufficiently adversarial (and
 almost certainly practically unreachable) histogram. It has not been fuzz
 tested across many inputs, only validated against the one histogram that's
 known to trigger the original bug.
+
+## Second candidate: deny fusion with explicit conversions
+
+An alternative to widening precision: stay in `float32` throughout, but
+insert an explicit `float32(...)` conversion around each multiply before
+it feeds an add/subtract, denying the compiler a legal `a*b+c`/`a*b-c`
+expression tree to contract into an FMA:
+
+```go
+func mFastLog2NoFuse(val float32) float32 {
+	ux := int32(math.Float32bits(val))
+	log2 := float32(((ux >> 23) & 255) - 128)
+	ux &= -0x7f800001
+	ux += 127 << 23
+	uval := math.Float32frombits(uint32(ux))
+
+	p := float32(-0.34484843*uval) + 2.02466578
+	q := float32(p*uval) - 0.67487759
+	log2 += q
+
+	return log2
+}
+```
+
+Disassembly confirms this compiles to plain `FMULS`/`FADDS`/`FMULS`/`FSUBS`
+on arm64 — no `FMADDS`/`FNMSUBS` at all — and, called directly for every
+value in the captured histogram, it's bit-identical to amd64 on every
+single call.
+
+But wiring it straight into `estimatedBits` (`float-divergence/`'s
+`no-fuse, partial` line) **still reproduces the original divergence**,
+unchanged: `250361.98`/`250361` on arm64, `250362.06`/`250362` on amd64.
+`mFastLog2` itself is fixed; `EstimatedBits()` as a whole is not. Why:
+`estimatedBits`'s own accumulation line —
+
+```go
+shannon += atLeastOne(-log2(nn*invTotal)) * nn
+```
+
+— is an *independent* multiply-accumulate expression, and disassembly
+shows the compiler fuses it into `FMADDS` on arm64 regardless of which
+`mFastLog2` variant is plugged in as `log2`. It's a second, separate FMA
+site that has nothing to do with the first one. Wrapping *that* multiply
+too —
+
+```go
+shannon = shannon + float32(atLeastOne(-mFastLog2NoFuse(nn*invTotal))*nn)
+```
+
+— (`estimatedBitsNoFuse`, the `no-fuse, full` line) finally gets rid of
+the divergence, and does so more strongly than the float64 rewrite: the
+result is **bit-for-bit identical** across architectures (`48747e84` on
+both), not merely equal after `int()` truncation:
+
+```
+arm64:  no-fuse, full:  shannon_bits=48747e84 shannon=250362.06 result=250362
+amd64:  no-fuse, full:  shannon_bits=48747e84 shannon=250362.06 result=250362
+```
+
+The lesson: this technique works, but it's whack-a-mole. Every
+multiply-then-add/subtract expression anywhere in the call chain that
+touches the value is an independent fusion opportunity, on every
+architecture whose backend fuses; missing even one (as the first,
+`mFastLog2`-only attempt did) leaves the exact same bug in place with no
+indication anything is still wrong short of re-testing across
+architectures. The float64 rewrite doesn't have this problem — it doesn't
+try to prevent fusion at any site, it just makes whatever fusion happens
+too small to matter — which is why it's the rewrite actually recommended
+above, despite being "only" equal-after-truncation rather than
+bit-identical: it degrades gracefully if some other fusion site is found
+later, where the no-fuse approach would need to be reaudited from scratch.
